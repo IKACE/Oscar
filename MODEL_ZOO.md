@@ -272,8 +272,8 @@ python oscar/run_captioning.py \
     --do_test \
     --do_eval \
     --test_yaml test.yaml \
-    --per_gpu_eval_batch_size 64 \
+    --no_cuda
     --num_beams 5 \
     --max_gen_length 20 \
-    --eval_model_dir your_model_for_evaluation # could be bert base/large.
+    --eval_model_dir weights/checkpoint0 # could be bert base/large.
 ```

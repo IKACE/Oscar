@@ -29,7 +29,7 @@ from transformers.pytorch_transformers import AdamW, WarmupLinearSchedule, Warmu
 class CaptionTSVDataset(Dataset):
     def __init__(self, yaml_file, tokenizer=None, add_od_labels=True,
             max_img_seq_length=50, max_seq_length=70, max_seq_a_length=40, 
-            is_train=True, mask_prob=0.15, max_masked_tokens=3, **kwargs):
+            is_train=True, mask_prob=0.15, max_masked_tokens=3, overfit=False, **kwargs):
         """Constructor.
         Args:
             yaml file with all required data (image feature, caption, labels, etc)
@@ -41,6 +41,7 @@ class CaptionTSVDataset(Dataset):
             is_train: train or test mode.
             mask_prob: probability to mask a input token.
             max_masked_tokens: maximum number of tokens to be masked in one sentence.
+            overfit: provide a small dataset to test pipeline
             kwargs: other arguments.
         """
         self.yaml_file = yaml_file
@@ -50,17 +51,25 @@ class CaptionTSVDataset(Dataset):
         self.feat_file = find_file_path_in_yaml(self.cfg['feature'], self.root)
         self.caption_file = find_file_path_in_yaml(self.cfg.get('caption'), self.root)
 
+        self.overfit = overfit
+
         assert op.isfile(self.feat_file)
         if add_od_labels: assert op.isfile(self.label_file)
         if is_train: assert op.isfile(self.caption_file) and tokenizer is not None
 
         self.label_tsv = None if not self.label_file else TSVFile(self.label_file)
         self.feat_tsv = TSVFile(self.feat_file)
+        
         self.captions = []
         if self.caption_file and op.isfile(self.caption_file):
-            with open(self.caption_file, 'r') as f:
-                self.captions = json.load(f)
-
+            if self.overfit == False:
+                with open(self.caption_file, 'r') as f:
+                    self.captions = json.load(f)
+            else:
+                with open("./datasets/coco_caption/test_caption_overfit.json", 'r') as f:
+                    self.captions = json.load(f)                
+        # if self.overfit == True:
+        #     self.captions = self.captions[0:100]
         self.tokenizer = tokenizer
         self.tensorizer = CaptionTensorizer(self.tokenizer, max_img_seq_length,
                 max_seq_length, max_seq_a_length, mask_prob, max_masked_tokens,
@@ -81,17 +90,33 @@ class CaptionTSVDataset(Dataset):
 
     def prepare_image_keys(self):
         tsv = self.get_valid_tsv()
-        return [tsv.seek(i)[0] for i in range(tsv.num_rows())]
+        if self.overfit == True:
+            try:
+                return [tsv.seek(i)[0] for i in range(100)]
+            except Exception as e:
+                print("Original dataset smaller than 100!")
+                raise
+        else:
+            return [tsv.seek(i)[0] for i in range(tsv.num_rows())]
 
     def prepare_image_key_to_index(self):
         tsv = self.get_valid_tsv()
-        return {tsv.seek(i)[0] : i for i in range(tsv.num_rows())}
+        if self.overfit == True:
+            try:
+                return {tsv.seek(i)[0] : i for i in range(100)}
+            except Exception as e:
+                print("Original dataset smaller than 100!")
+                raise
+        else:
+            return {tsv.seek(i)[0] : i for i in range(tsv.num_rows())}
 
     def prepare_image_key_to_captions(self):
         if self.captions:
             key2captions = {key: [] for key in self.image_keys}
             for cap in self.captions:
                 key2captions[cap['image_id']].append(cap['caption'])
+            # for key in self.image_keys:
+            #     key2captions[key].append(cap['caption'])
             return key2captions
 
     def get_image_index(self, idx):
@@ -142,7 +167,7 @@ class CaptionTSVDataset(Dataset):
         return img_key, example
 
     def __len__(self):
-        if self.is_train:
+        if self.is_train or self.overfit:
             return len(self.captions)
         return self.get_valid_tsv().num_rows()
 
@@ -341,7 +366,7 @@ def build_dataset(yaml_file, tokenizer, args, is_train=True):
     return dataset_class(yaml_file, tokenizer=tokenizer,
             add_od_labels=args.add_od_labels, max_img_seq_length=args.max_img_seq_length,
             max_seq_length=args.max_seq_length, max_seq_a_length=args.max_gen_length,
-            is_train=False)
+            is_train=False, overfit=args.overfit)
 
 
 def make_data_sampler(dataset, shuffle, distributed):
@@ -579,7 +604,7 @@ def scst_train_iter(args, train_dataloader, model, scst_criterion,
     return loss
 
 
-def get_predict_file(output_dir, yaml_file, args):
+def  get_predict_file(output_dir, yaml_file, args):
     cc = ['pred']
     # make sure it works with/without / in end of the path.
     data = op.basename(op.join(args.data_dir, '')[:-1])
@@ -727,6 +752,7 @@ def restore_training_settings(args):
         assert args.do_test or args.do_eval
         checkpoint = args.eval_model_dir
     # restore training settings, check hasattr for backward compatibility
+    print(op.join(checkpoint, 'training_args.bin'))
     train_args = torch.load(op.join(checkpoint, 'training_args.bin'))
     if hasattr(train_args, 'max_seq_a_length'):
         if hasattr(train_args, 'scst') and train_args.scst:
@@ -921,6 +947,8 @@ def main():
                         help='Use constrained beam search for decoding')
     parser.add_argument('--min_constraints_to_satisfy', type=int, default=2,
                         help="minimum number of constraints to satisfy")
+    parser.add_argument('--overfit', action='store_true',
+                        help="whether to construct a small dataset for pipeline testing")
     args = parser.parse_args()
 
     global logger
@@ -931,6 +959,8 @@ def main():
     args.num_gpus = get_world_size()
     args.distributed = args.num_gpus > 1
     args.device = torch.device('cuda')
+
+    # args.do_eval = True
     synchronize()
 
     output_dir = args.output_dir
@@ -972,7 +1002,11 @@ def main():
         logger.info("Evaluate the following checkpoint: %s", checkpoint)
         model = model_class.from_pretrained(checkpoint, config=config)
 
-    model.to(args.device)
+    if args.no_cuda:
+        pass
+    else:
+        model.to(args.device)
+
     logger.info("Training/evaluation parameters %s", args)
     if args.do_train:
         train_dataloader = make_data_loader(args, args.train_yaml, tokenizer,
